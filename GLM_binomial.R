@@ -1,0 +1,323 @@
+# ==============================================================================
+# SCRIPT DE R - MATERIAL SUPLEMENTARIO (VERSIÓN INTEGRADA Y OPTIMIZADA)
+# Análisis de sesgos en datos de biodiversidad: Herbario vs Ciencia Ciudadana
+# Caso de Estudio: Hotspot de Chile Central vs. Parque Nacional Nevado de Tres Cruces
+# Curso: Métodos para el Estudio de la Ecología y la Biodiversidad - UST
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# PASO 0: Instalación y carga de librerías (VERSIÓN CORREGIDA PARA COMPILACIÓN)
+# ------------------------------------------------------------------------------
+# 1. SOLUCIÓN AL ERROR DE RED: Forzar a R a usar la conexión nativa de Windows
+options(download.file.method = "wininet")
+
+# 2. Definir un repositorio espejo en la nube oficial (CRAN Cloud) como alternativa segura
+repo_seguro <- "https://cloud.r-project.org"
+
+# Vector de paquetes principales (Incluye readr, spatstat.geom para NNI y DHARMa para supuestos)
+paquetes <- c("TNRS", "CoordinateCleaner", "dplyr", "sf", "spatialEco", 
+              "spatstat.geom", "DHARMa", "ggplot2", "tidyr", "boot", "readr")
+
+# 3. Instalación de la raíz geométrica (s2 y sf) de forma binaria secuencial
+if (!requireNamespace("s2", quietly = TRUE)) {
+  message("Instalando s2 desde espejo seguro...")
+  install.packages("s2", repos = repo_seguro, type = "binary")
+}
+if (!requireNamespace("sf", quietly = TRUE)) {
+  message("Instalando sf desde espejo seguro...")
+  install.packages("sf", repos = repo_seguro, type = "binary")
+}
+
+# 4. DEPENDENCIAS OCULTAS INTEGRADAS (Soporte para CoordinateCleaner y la suite spatstat)
+# Agregamos aquí los subpaquetes hermanos para evitar que colapse la geometría espacial
+dependencias_ocultas <- c("geosphere", "rgbif", "rnaturalearth", 
+                          "spatstat.utils", "spatstat.data", "spatstat.sparse", "spatstat.univar")
+
+missing_deps <- dependencias_ocultas[!(dependencias_ocultas %in% installed.packages()[,"Package"])]
+if(length(missing_deps)) {
+  message("Instalando dependencias ocultas de soporte geográfico y estadístico...")
+  install.packages(missing_deps, repos = repo_seguro, type = "binary")
+}
+
+# 5. Paquetes principales restantes y nuevas dependencias diagnósticas
+install_if_missing <- paquetes[!(paquetes %in% installed.packages()[,"Package"])]
+if(length(install_if_missing)) {
+  message("Instalando paquetes principales y de diagnóstico faltantes...")
+  install.packages(install_if_missing, repos = repo_seguro, type = "binary")
+}
+
+# 6. Carga segura de librerías en el entorno de RStudio
+invisible(lapply(paquetes, library, character.only = TRUE))
+message("¡Desbloqueo e integración exitosa! Todo instalado, parcheado y cargado sin errores.")
+
+# ------------------------------------------------------------------------------
+# PASO 1: Importación de datos y definición de especies blanco (Hotspot vs. Altiplano)
+# ------------------------------------------------------------------------------
+# 1.1 Diccionario taxonómico completo (20 especies reales del manuscrito)
+df_grupos <- data.frame(
+  species = c(
+    # ZONA CENTRAL (Carismáticas, leñosas, estructurantes y/o amenazadas)
+    "Neltuma chilensis", "Porlieria chilensis", "Vasconcellea chilensis", 
+    "Vachellia caven", "Citronella mucronata", "Aextoxicon punctatum", 
+    "Luma apiculata", "Drimys winterii", "Lithraea caustica", "Maytenus boaria",
+    # ALTOANDINO - HUMEDALES (Inconspicuas de fácil ID fotográfico)
+    "Calandrinia compacta", "Halerpestes exilis", "Arenaria serpens", "Arenaria rivularis",
+    # ALTOANDINO - HUMEDALES (Inconspicuas de difícil ID - Graminoides de bofedal)
+    "Oxychloe andina", "Carex melanocystis", "Zameioscirpus atacamensis", 
+    "Puccinellia frigida", "Deschampsia eminens", "Calamagrostis velutina"
+  ),
+  grupo_morfologico = c(
+    rep("Carismatica_Zona_Central", 10),
+    rep("Inconspicua_Andina_Facil", 4),
+    rep("Inconspicua_Andina_Dificil", 6)
+  )
+)
+
+# 1.2 Carga del archivo bruto local descargado de GBIF
+# R abrirá una ventana para que selecciones tu archivo CSV 
+print("Seleccione el archivo plano descargado de GBIF...")
+ocurrencias <- read_csv(file.choose(), guess_max = 50000)
+
+# 1.3 Filtrado estructural inicial (Filtro temporal 2004-2024 y de procedencia)
+ocurrencias_filtro <- ocurrencias %>%
+  # Limitar a colecciones de herbario (PRESERVED_SPECIMEN) y ciencia ciudadana (HUMAN_OBSERVATION)
+  filter(basisOfRecord %in% c("PRESERVED_SPECIMEN", "HUMAN_OBSERVATION")) %>%
+  # Limpiar registros sin coordenadas espaciales
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude)) %>%
+  # Ventana temporal de análisis (Consistente con la era de iNaturalist)
+  filter(year >= 2004 & year <= 2024) %>%
+  select(species, decimalLongitude, decimalLatitude, year, month, basisOfRecord, recordedBy)
+
+# ------------------------------------------------------------------------------
+# PASO 2: Armonización Taxonómica, Limpieza y Armonización Espacial por Grilla (0.5°)
+# ------------------------------------------------------------------------------
+
+# 2.1 Armonización Taxonómica Real con TNRS (Soluciona el error de nombres huérfanos)
+print("Ejecutando resolución taxonómica mediante la API de TNRS...")
+nombres_unicos <- unique(ocurrencias_filtro$species)
+nombres_resueltos <- TNRS(taxonomic_names = nombres_unicos)
+
+# Mapear e integrar los nombres validados de vuelta al set de datos principal
+df_nombres_map <- nombres_resueltos %>% 
+  select(Name_submitted, Accepted_species) %>% 
+  distinct()
+
+datos_armonizados <- ocurrencias_filtro %>%
+  left_join(df_nombres_map, by = c("species" = "Name_submitted")) %>%
+  # Reemplazar nombre original por el aceptado sistemáticamente por TNRS
+  mutate(species = ifelse(!is.na(Accepted_species), Accepted_species, species)) %>%
+  select(-Accepted_species)
+
+# 2.2 Control de calidad de coordenadas espaciales con CoordinateCleaner
+print("Filtrando anomalías geográficas y coordenadas institucionales...")
+datos_curados <- clean_coordinates(x = datos_armonizados, 
+                                   lon = "decimalLongitude", 
+                                   lat = "decimalLatitude",
+                                   species = "species",
+                                   tests = c("capitals", "centroids", "institutions", "zeros"))
+
+# Retener únicamente registros geográficamente válidos
+datos_curados <- datos_curados %>% filter(.summary == TRUE)
+
+# 2.3 Conversión a Objeto Espacial (SF) y Armonización por Grilla de 0.5° x 0.5°
+# (Soluciona el error de geoprivacidad/difuminado de 40 km para especies amenazadas)
+puntos_sf <- st_as_sf(datos_curados, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Crear grilla regular de 0.5 grados
+grilla_macro <- st_make_grid(puntos_sf, cellsize = 0.5, what = "polygons") %>%
+  st_sf(grid_id = 1:length(.))
+
+# Intersección espacial: asignar cada coordenada a un bloque de la grilla
+puntos_grillados <- st_join(puntos_sf, grilla_macro)
+
+# Obtener centroides de la grilla para mapeo y desduplicación espacial (thinning)
+centroides <- st_centroid(grilla_macro) %>% 
+  st_coordinates() %>% 
+  as.data.frame() %>% 
+  mutate(grid_id = 1:n())
+
+# 2.4 Thinning Espacio-Temporal y binarización de variables de origen
+datos_finales <- puntos_grillados %>%
+  as.data.frame() %>%
+  left_join(centroides, by = "grid_id") %>%
+  rename(lon_celda = X, lat_celda = Y) %>%
+  # Eliminar redundancia: retener un solo registro por especie, celda, año y mes
+  distinct(species, year, month, grid_id, basisOfRecord, .keep_all = TRUE) %>%
+  # Integrar el clasificador de grupos morfológicos/geográficos de nuestro diccionario
+  left_join(df_grupos, by = "species") %>%
+  # Excluir especies accidentales no pertenecientes a las 20 blanco
+  filter(!is.na(grupo_morfologico)) %>%
+  # Variable respuesta binaria (1 = iNaturalist, 0 = Herbario)
+  mutate(es_iNat = ifelse(basisOfRecord == "HUMAN_OBSERVATION", 1, 0))
+
+# ------------------------------------------------------------------------------
+# PASO 3: Análisis del Coeficiente de Varianza (CV)
+# ------------------------------------------------------------------------------
+cv_analisis <- datos_finales %>%
+  group_by(basisOfRecord, species) %>%
+  summarise(conteo = n(), .groups = 'drop') %>%
+  group_by(basisOfRecord) %>%
+  summarise(
+    media = mean(conteo),
+    desv_est = sd(conteo),
+    CV_porcentaje = (desv_est / media) * 100
+  )
+print("Análisis del Coeficiente de Varianza (CV) por origen:")
+print(cv_analisis)
+
+# ------------------------------------------------------------------------------
+# PASO 4: Nearest Neighbor Index (NNI) Proyectado (Métrico) en UTM 19S
+# ------------------------------------------------------------------------------
+# 4.1 Filtrar proactivamente cualquier celda que haya quedado con valores NA
+datos_para_mapa <- datos_finales %>%
+  filter(!is.na(lon_celda) & !is.na(lat_celda))
+
+# 4.2 Convertir a objeto espacial (sf) y proyectar a metros (UTM 19S - EPSG: 32719)
+especie_test_sf <- st_as_sf(datos_para_mapa, 
+                            coords = c("lon_celda", "lat_celda"), 
+                            crs = 4326) %>%
+  filter(species == "Aextoxicon punctatum") %>% # Aquí puedes cambiar la especie de prueba
+  st_transform(32719) 
+
+# 4.3 Segregación por origen para el cálculo del NNI
+coords_inat_proj <- especie_test_sf %>% filter(es_iNat == 1)
+coords_herb_proj <- especie_test_sf %>% filter(es_iNat == 0)
+
+print("Análisis de agrupamiento espacial (NNI Proyectado UTM 19S):")
+if(nrow(coords_inat_proj) > 5) {
+  nni_inat <- nni(coords_inat_proj)
+  print(paste("NNI iNaturalist (Clustering real en metros):", round(nni_inat$NNI, 3)))
+} else {
+  print("Registros insuficientes de iNaturalist para calcular el NNI de esta especie.")
+}
+
+if(nrow(coords_herb_proj) > 5) {
+  nni_herb <- nni(coords_herb_proj)
+  print(paste("NNI Herbario (Clustering real en metros):", round(nni_herb$NNI, 3)))
+} else {
+  print("Registros insuficientes de Herbario para calcular el NNI de esta especie.")
+}
+
+# ------------------------------------------------------------------------------
+# PASO 5: Modelado de la Transición Digital y Estimación por Bootstrap
+# ------------------------------------------------------------------------------
+# 5.1 Ajustar factores y redefinir la categoría base para contraste
+datos_finales$grupo_morfologico <- as.factor(datos_finales$grupo_morfologico)
+datos_finales$grupo_morfologico <- relevel(datos_finales$grupo_morfologico, ref = "Carismatica_Zona_Central")
+
+# Ajuste del Modelo Lineal Generalizado Binomial
+modelo_completo <- glm(es_iNat ~ year * grupo_morfologico, family = binomial(link = "logit"), data = datos_finales)
+modelo_nulo <- glm(es_iNat ~ year, family = binomial(link = "logit"), data = datos_finales)
+
+print("Resumen de Coeficientes del GLM Completo:")
+summary(modelo_completo)
+
+print("Prueba de ANOVA (Razón de verosimilitud) contra el modelo nulo:")
+anova(modelo_nulo, modelo_completo, test = "Chisq")
+
+# 5.1-b: Evaluación de Supuestos mediante Residuos Simulados (DHARMa)
+if(!require("DHARMa")) install.packages("DHARMa")
+library(DHARMa)
+
+# 1. Simular residuos basados en nuestro modelo binomial
+residuos_simulados <- simulateResiduals(fittedModel = modelo_completo, n = 1000)
+
+# 2. Desplegar gráficos de diagnóstico (QQ-plot de uniformidad y dispersión)
+plot(residuos_simulados)
+
+# 3. Test formal de Outliers (Puntos de alta influencia)
+testOutliers(residuos_simulados, type = "bootstrap")
+
+# 5.2 Remuestreo Bootstrap No Paramétrico (1,000 réplicas)
+print("Ejecutando estimaciones de intervalo Bootstrap (esto puede tomar un minuto)...")
+boot_fn <- function(data, indices) {
+  df_sub <- data[indices, ]
+  fit <- glm(es_iNat ~ year * grupo_morfologico, family = binomial(link = "logit"), data = df_sub)
+  return(coef(fit)) # Retornar coeficientes del modelo
+}
+
+set.seed(123) # Asegura reproducibilidad de los IC bootstrap
+res_boot <- boot(data = datos_finales, statistic = boot_fn, R = 1000)
+
+# Extraer el Intervalo de Confianza para la tasa de cambio de las crípticas andinas (interacción)
+print("IC Bootstrap (Percentil 95%) para la Interacción 'year:Inconspicua_Andina_Dificil':")
+print(boot.ci(res_boot, type = "perc", index = 6)) 
+
+# ------------------------------------------------------------------------------
+# PASO 6: Extracción de Intervalos de Confianza Bootstrap
+# ------------------------------------------------------------------------------
+print("Calculando intervalos de confianza bootstrap para los coeficientes...")
+
+# 1. Ver el resumen básico (Muestra el Coeficiente, el Sesgo y el Error Estándar)
+print(res_boot)
+
+# 2. Crear una función automatizada para extraer los Intervalos de Confianza Percentiles (95%)
+obtener_ic_boot <- function(boot_obj, num_coefs = 6) {
+  tabla_ci <- data.frame(
+    Coeficiente_Index = 1:num_coefs,
+    IC_2.5 = NA,
+    IC_97.5 = NA
+  )
+  
+  for(i in 1:num_coefs) {
+    ci <- boot.ci(boot_obj, type = "perc", index = i)
+    if(!is.null(ci)) {
+      tabla_ci$IC_2.5[i]  <- ci$percent[4]
+      tabla_ci$IC_97.5[i] <- ci$percent[5]
+    }
+  }
+  return(tabla_ci)
+}
+
+# 3. Generar la tabla de intervalos
+intervalos_bootstrap <- obtener_ic_boot(res_boot, num_coefs = 6)
+
+# 4. Unir los coeficientes originales con sus nuevos intervalos corregidos
+tabla_final_paper <- data.frame(
+  Variable = names(coef(modelo_completo)), # Nombre de tus variables y efectos de interacción
+  Coeficiente_Original = res_boot$t0,
+  Error_Estandar_Boot = apply(res_boot$t, 2, sd), # Error estándar corregido por bootstrap
+  IC_Inferior_2.5 = intervalos_bootstrap$IC_2.5,
+  IC_Superior_97.5 = intervalos_bootstrap$IC_97.5
+)
+
+# Mostrar en consola la tabla lista para exportar a Word/Excel
+View(tabla_final_paper)
+
+# ------------------------------------------------------------------------------
+# PASO 7: Visualización Avanzada en ggplot2 (Formato de Publicación Wiley/GEB)
+# ------------------------------------------------------------------------------
+grafico_tendencia <- ggplot(datos_finales, aes(x = year, y = es_iNat, color = grupo_morfologico)) +
+  geom_jitter(height = 0.03, alpha = 0.25, size = 1.5) + 
+  # Ajustar curvas logísticas del GLM por cada grupo funcional
+  stat_smooth(method = "glm", method.args = list(family = "binomial"), 
+              se = TRUE, linewidth = 1.2, aes(fill = grupo_morfologico), alpha = 0.1) +
+  # Usar paleta estandarizada de alta legibilidad
+  scale_color_viridis_d(option = "plasma", labels = c("Carismáticas Chile Central", 
+                                                      "Inconspicuas Altiplano (Fácil ID)", 
+                                                      "Cripticas Altiplano (Difícil ID)")) +
+  scale_fill_viridis_d(option = "plasma", labels = c("Carismáticas Chile Central", 
+                                                     "Inconspicuas Altiplano (Fácil ID)", 
+                                                     "Cripticas Altiplano (Difícil ID)")) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "Transición Tecnológica de la Flora Nativa Chilena (2004-2024)",
+    subtitle = "Modelado probabilístico (iNaturalist vs. Herbario) según morfología y accesibilidad",
+    x = "Año del Registro",
+    y = "Probabilidad Estimada de Origen iNaturalist (%)",
+    color = "Categorías Funcionales",
+    fill = "Categorías Funcionales"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(face = "italic", color = "gray30")
+  )
+
+# Desplegar visualización
+print(grafico_tendencia)
+
+# Guardar figura en calidad TIFF para envío a la revista GEB
+ggsave("Figura_3_Transicion_Logistica.tiff", dpi = 300, width = 10, height = 7, units = "in")
